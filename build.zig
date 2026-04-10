@@ -9,14 +9,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const zig_command_dep = b.dependency("zig_command", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zig_command_mod = zig_command_dep.module("zig_command");
+
     const exe = b.addExecutable(.{
-        .name = "open-responses-demo",
+        .name = "openresponses",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "open_responses", .module = mod },
+                .{ .name = "zig_command", .module = zig_command_mod },
             },
         }),
     });

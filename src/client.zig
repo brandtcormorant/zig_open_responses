@@ -496,6 +496,25 @@ pub fn functionTool(
     };
 }
 
+/// Build an array of types.Tool from ToolHandler descriptions.
+/// Only includes handlers that have description and parameters_json set.
+pub fn toolDefsFromHandlers(allocator: Allocator, handlers: []const ToolHandler) ![]const types.Tool {
+    var list = std.ArrayList(types.Tool).empty;
+    for (handlers) |h| {
+        const desc = h.description orelse continue;
+        const params_json = h.parameters_json orelse continue;
+        const params = std.json.parseFromSlice(std.json.Value, allocator, params_json, .{}) catch continue;
+        try list.append(allocator, .{
+            .function = .{
+                .name = h.name,
+                .description = desc,
+                .parameters = params.value,
+            },
+        });
+    }
+    return list.items;
+}
+
 // ---------------------------------------------------------------------------
 // Item conversion
 // ---------------------------------------------------------------------------
@@ -543,16 +562,22 @@ fn convertContentParts(allocator: Allocator, parts: []const types.ContentPart) !
             else => {},
         }
     }
-    if (output_list.items.len == 0) return .{ .string = "" };
+
+    if (output_list.items.len == 0) {
+        return .{ .string = "" };
+    }
+
     return .{ .parts = output_list.items };
 }
 
 /// Converts output ItemField slice to input ItemParam slice (allocating).
 pub fn itemFieldsToParams(allocator: Allocator, fields: []const types.ItemField) ![]types.ItemParam {
     var list = std.ArrayList(types.ItemParam).empty;
+
     for (fields) |field| {
         try list.append(allocator, try itemFieldToParam(allocator, field));
     }
+
     return list.toOwnedSlice(allocator);
 }
 
@@ -573,7 +598,46 @@ pub const ToolHandler = struct {
     name: []const u8,
     callback: *const fn (ctx: *anyopaque, name: []const u8, arguments: []const u8) anyerror!ToolResult,
     ctx: *anyopaque,
+    /// Tool description for LLM schema generation. Optional for backward compatibility.
+    description: ?[]const u8 = null,
+    /// JSON Schema string for tool parameters. Optional for backward compatibility.
+    parameters_json: ?[]const u8 = null,
+
+    /// Returns a Tool definition for inclusion in API requests.
+    /// Requires description and parameters_json to be set.
+    pub fn toFunctionTool(self: ToolHandler) ?types.Tool {
+        const desc = self.description orelse return null;
+        const params_json = self.parameters_json orelse return null;
+        const params = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, params_json, .{}) catch return null;
+        return .{ .function = .{
+            .name = self.name,
+            .description = desc,
+            .parameters = params.value,
+        } };
+    }
 };
+
+/// Generate a ToolHandler from a typed struct at comptime.
+///
+/// The type T must declare:
+///   - `pub const tool_name: []const u8`
+///   - `pub const tool_description: []const u8`
+///   - `pub const tool_params: []const u8` (JSON Schema)
+///   - `pub fn execute(self: *T, name: []const u8, arguments: []const u8) anyerror!ToolResult`
+pub fn toolHandler(comptime T: type, instance: *T) ToolHandler {
+    return .{
+        .name = T.tool_name,
+        .callback = &struct {
+            fn f(ctx: *anyopaque, n: []const u8, args: []const u8) anyerror!ToolResult {
+                const self: *T = @ptrCast(@alignCast(ctx));
+                return self.execute(n, args);
+            }
+        }.f,
+        .ctx = @ptrCast(instance),
+        .description = T.tool_description,
+        .parameters_json = T.tool_params,
+    };
+}
 
 /// Bundled response callback for tool loop notifications.
 pub const OnResponseCallback = struct {
@@ -589,6 +653,14 @@ pub const ToolLoopOptions = struct {
     /// name. Any other tool calls in the same response are still executed
     /// and their results are returned in `done_tool_results`.
     done_tool_name: ?[]const u8 = null,
+    /// Called after each tool execution turn. Returns items to inject
+    /// before the next LLM call. Empty slice = no steering.
+    get_steering: ?*const fn (ctx: *anyopaque) []const types.ItemParam = null,
+    steering_ctx: ?*anyopaque = null,
+    /// Called when the model stops calling tools and no steering is pending.
+    /// Returns items to continue the conversation. Empty slice = done.
+    get_follow_ups: ?*const fn (ctx: *anyopaque) []const types.ItemParam = null,
+    follow_up_ctx: ?*anyopaque = null,
 };
 
 /// Result payload for a completed response, optionally with done-tool results.
@@ -646,6 +718,33 @@ pub fn executeTools(
     }
 
     return results.toOwnedSlice(allocator);
+}
+
+/// Detects responses that promise action without issuing tool calls.
+/// Checks for common phrases like "I'll try", "Let me check", etc.
+fn looksLikeUnfulfilledPromise(text: []const u8) bool {
+    const needles = [_][]const u8{
+        "I'll try",
+        "I'll check",
+        "I'll look",
+        "I'll search",
+        "I'll run",
+        "I'll execute",
+        "I'll read",
+        "I'll write",
+        "Let me try",
+        "Let me check",
+        "Let me look",
+        "Let me search",
+        "Let me run",
+        "Let me read",
+        "let me try",
+        "let me check",
+    };
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, text, needle) != null) return true;
+    }
+    return false;
 }
 
 fn findHandler(handlers: []const ToolHandler, name: []const u8) ?ToolHandler {
@@ -708,6 +807,8 @@ pub fn toolLoop(
 ) !ToolLoopResult {
     var input_list = try initInputList(arena, params.input);
     var turn: u32 = 0;
+    var empty_retries: u32 = 0;
+    var follow_through_retries: u32 = 0;
 
     while (turn < options.max_turns) {
         // Build params for this turn
@@ -728,6 +829,72 @@ pub fn toolLoop(
                 const fcs = try extractFunctionCallsAlloc(arena, resp);
 
                 if (fcs.len == 0) {
+                    const response_text = getOutputText(resp);
+
+                    // Guardrail: empty response retry (max 1)
+                    if (response_text.len == 0 and empty_retries < 1 and turn < options.max_turns) {
+                        empty_retries += 1;
+                        const out_params = try itemFieldsToParams(arena, resp.output);
+                        for (out_params) |p| {
+                            try input_list.append(arena, p);
+                        }
+                        try input_list.append(arena, .{
+                            .message = .{ .user = .{
+                                .role = .user,
+                                .content = .{ .string = "Your previous reply was empty. Respond with a direct answer or emit the necessary tool calls." },
+                            } },
+                        });
+                        continue;
+                    }
+
+                    // Guardrail: forced follow-through (max 2)
+                    if (response_text.len > 0 and follow_through_retries < 2 and turn < options.max_turns and
+                        looksLikeUnfulfilledPromise(response_text))
+                    {
+                        follow_through_retries += 1;
+                        const out_params = try itemFieldsToParams(arena, resp.output);
+                        for (out_params) |p| {
+                            try input_list.append(arena, p);
+                        }
+                        try input_list.append(arena, .{
+                            .message = .{ .user = .{
+                                .role = .user,
+                                .content = .{ .string = "You just promised to take action but did not issue any tool calls. Issue the appropriate tool calls now, or state the limitation clearly." },
+                            } },
+                        });
+                        continue;
+                    }
+
+                    // Check steering before stopping
+                    if (options.get_steering) |get_steer| {
+                        const steering = get_steer(options.steering_ctx.?);
+                        if (steering.len > 0) {
+                            const out_params = try itemFieldsToParams(arena, resp.output);
+                            for (out_params) |p| {
+                                try input_list.append(arena, p);
+                            }
+                            for (steering) |item| {
+                                try input_list.append(arena, item);
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Check follow-ups before stopping
+                    if (options.get_follow_ups) |get_fu| {
+                        const follow_ups = get_fu(options.follow_up_ctx.?);
+                        if (follow_ups.len > 0) {
+                            const out_params = try itemFieldsToParams(arena, resp.output);
+                            for (out_params) |p| {
+                                try input_list.append(arena, p);
+                            }
+                            for (follow_ups) |item| {
+                                try input_list.append(arena, item);
+                            }
+                            continue;
+                        }
+                    }
+
                     return .{ .response = .{ .response = resp } };
                 }
 
@@ -753,6 +920,14 @@ pub fn toolLoop(
                 const tool_results = try executeTools(arena, fcs, handlers);
                 for (tool_results) |tr| {
                     try input_list.append(arena, tr);
+                }
+
+                // Check steering after tool execution
+                if (options.get_steering) |get_steer| {
+                    const steering = get_steer(options.steering_ctx.?);
+                    for (steering) |item| {
+                        try input_list.append(arena, item);
+                    }
                 }
             },
         }
@@ -803,6 +978,8 @@ pub fn streamToolLoop(
 ) !StreamToolLoopResult {
     var input_list = try initInputList(arena, params.input);
     var turn: u32 = 0;
+    var empty_retries: u32 = 0;
+    var follow_through_retries: u32 = 0;
 
     while (turn < options.max_turns) {
         var turn_params = params;
@@ -845,6 +1022,72 @@ pub fn streamToolLoop(
                 const fcs = try extractFunctionCallsAlloc(arena, resp);
 
                 if (fcs.len == 0) {
+                    const response_text = getOutputText(resp);
+
+                    // Guardrail: empty response retry (max 1)
+                    if (response_text.len == 0 and empty_retries < 1 and turn < options.max_turns) {
+                        empty_retries += 1;
+                        const out_params = try itemFieldsToParams(arena, resp.output);
+                        for (out_params) |p| {
+                            try input_list.append(arena, p);
+                        }
+                        try input_list.append(arena, .{
+                            .message = .{ .user = .{
+                                .role = .user,
+                                .content = .{ .string = "Your previous reply was empty. Respond with a direct answer or emit the necessary tool calls." },
+                            } },
+                        });
+                        continue;
+                    }
+
+                    // Guardrail: forced follow-through (max 2)
+                    if (response_text.len > 0 and follow_through_retries < 2 and turn < options.max_turns and
+                        looksLikeUnfulfilledPromise(response_text))
+                    {
+                        follow_through_retries += 1;
+                        const out_params = try itemFieldsToParams(arena, resp.output);
+                        for (out_params) |p| {
+                            try input_list.append(arena, p);
+                        }
+                        try input_list.append(arena, .{
+                            .message = .{ .user = .{
+                                .role = .user,
+                                .content = .{ .string = "You just promised to take action but did not issue any tool calls. Issue the appropriate tool calls now, or state the limitation clearly." },
+                            } },
+                        });
+                        continue;
+                    }
+
+                    // Check steering before stopping
+                    if (options.get_steering) |get_steer| {
+                        const steering = get_steer(options.steering_ctx.?);
+                        if (steering.len > 0) {
+                            const out_params = try itemFieldsToParams(arena, resp.output);
+                            for (out_params) |p| {
+                                try input_list.append(arena, p);
+                            }
+                            for (steering) |item| {
+                                try input_list.append(arena, item);
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Check follow-ups before stopping
+                    if (options.get_follow_ups) |get_fu| {
+                        const follow_ups = get_fu(options.follow_up_ctx.?);
+                        if (follow_ups.len > 0) {
+                            const out_params = try itemFieldsToParams(arena, resp.output);
+                            for (out_params) |p| {
+                                try input_list.append(arena, p);
+                            }
+                            for (follow_ups) |item| {
+                                try input_list.append(arena, item);
+                            }
+                            continue;
+                        }
+                    }
+
                     return .{ .response = .{ .response = resp } };
                 }
 
@@ -868,8 +1111,18 @@ pub fn streamToolLoop(
                 }
 
                 const tool_results = try executeTools(arena, fcs, handlers);
+
                 for (tool_results) |tr| {
                     try input_list.append(arena, tr);
+                }
+
+                // Check steering after tool execution
+                if (options.get_steering) |get_steer| {
+                    const steering = get_steer(options.steering_ctx.?);
+
+                    for (steering) |item| {
+                        try input_list.append(arena, item);
+                    }
                 }
             },
         }
