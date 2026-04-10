@@ -33,17 +33,10 @@
     // internet connectivity.
     .dependencies = .{
         .zig_command = .{
-            .path = "../zig_command",
+            .url = "https://github.com/brandtcormorant/zig_command/archive/91c6847a2ca4934a9c1f8d183a33cb9203f2b735.tar.gz",
+            .hash = "zig_command-0.0.0-_ZyaA5VPAAB4mup63JI4P-xTIPyOS3UnYoUSVRZBOP_c",
         },
     },
-    // Specifies the set of files and directories that are included in this package.
-    // Only files and directories listed here are included in the `hash` that
-    // is computed for this package. Only files listed here will remain on disk
-    // when using the zig package manager. As a rule of thumb, one should list
-    // files required for compilation plus any license(s).
-    // Paths are relative to the build root. Use the empty string (`""`) to refer to
-    // the build root itself.
-    // A directory listed here means that all files within, recursively, are included.
     .paths = .{
         "build.zig",
         "build.zig.zon",
